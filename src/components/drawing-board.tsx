@@ -445,6 +445,7 @@ export function DrawingBoard() {
 
         <div
           ref={areaRef}
+          style={{ width: "100%", height: "100%" }}
           className="flex min-h-0 min-w-0 flex-1 items-center justify-center"
         >
           <div
