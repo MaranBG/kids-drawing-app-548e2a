@@ -23,9 +23,13 @@ import { floodFill, hexToRgb } from '@/drawing/flood-fill'
 import { sounds } from '@/drawing/sounds'
 import { PicturePicker } from '@/components/picture-picker'
 
-/** Fixed drawing resolution (4:3, like most tablets). Scaled to fit the screen. */
-const WIDTH = 1600
-const HEIGHT = 1200
+/**
+ * The canvas matches the shape of the drawing area and always holds about
+ * 1600×1200 pixels, so brush sizes look the same on every screen and the undo
+ * history stays light on tablets.
+ */
+const MAX_PIXELS = 1600 * 1200
+const RESIZE_DELAY = 150
 const MAX_UNDO = 10
 
 type ToolId = 'pencil' | 'brush' | 'rainbow' | 'bucket' | 'stamp' | 'eraser'
@@ -88,7 +92,7 @@ export function DrawingBoard() {
   const [canUndo, setCanUndo] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [flashKey, setFlashKey] = useState(0)
-  const [boardSize, setBoardSize] = useState({ width: 0, height: 0 })
+  const pageIdRef = useRef<string | null>(null)
 
   const currentTool = TOOLS.find((t) => t.id === tool)!
   const size = currentTool.sizes?.[sizeIndex] ?? 0
@@ -96,51 +100,97 @@ export function DrawingBoard() {
   const paintCtx = () =>
     paintRef.current?.getContext('2d', { willReadFrequently: true }) ?? null
 
+  /** Current canvas resolution, read from the paint layer itself. */
+  const dims = () => ({
+    width: paintRef.current?.width ?? 0,
+    height: paintRef.current?.height ?? 0,
+  })
+
   // --- Setup -------------------------------------------------------------
 
-  useEffect(() => {
-    const ctx = paintCtx()
-    if (!ctx) return
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, WIDTH, HEIGHT)
+  const renderOutline = useCallback((id: string | null) => {
+    const canvas = outlineRef.current
+    const ctx = canvas?.getContext('2d', { willReadFrequently: true })
+    if (!canvas || !ctx) return
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    const page = coloringPages.find((p) => p.id === id)
+    if (page) drawColoringPage(ctx, page, canvas.width, canvas.height)
   }, [])
 
-  // Keep the 4:3 board as large as possible inside the available space.
+  useEffect(() => {
+    pageIdRef.current = pageId
+    renderOutline(pageId)
+  }, [pageId, renderOutline])
+
+  // Fill the whole drawing area. Canvas sizes are set imperatively so React
+  // never resets them, and the drawing is kept when the area changes shape.
   useEffect(() => {
     const area = areaRef.current
     if (!area) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let initialized = false
+
+    const resize = (areaWidth: number, areaHeight: number) => {
+      const paint = paintRef.current
+      const outline = outlineRef.current
+      const ctx = paintCtx()
+      if (!paint || !outline || !ctx || areaWidth < 1 || areaHeight < 1) return
+      const scale = Math.sqrt(MAX_PIXELS / (areaWidth * areaHeight))
+      const width = Math.max(1, Math.round(areaWidth * scale))
+      const height = Math.max(1, Math.round(areaHeight * scale))
+      if (initialized && width === paint.width && height === paint.height) {
+        return
+      }
+
+      let previous: HTMLCanvasElement | null = null
+      if (initialized) {
+        previous = document.createElement('canvas')
+        previous.width = paint.width
+        previous.height = paint.height
+        previous.getContext('2d')!.drawImage(paint, 0, 0)
+      }
+
+      paint.width = width
+      paint.height = height
+      outline.width = width
+      outline.height = height
+      ctx.fillStyle = '#ffffff'
+      ctx.fillRect(0, 0, width, height)
+      if (previous) ctx.drawImage(previous, 0, 0)
+      renderOutline(pageIdRef.current)
+
+      // Older snapshots no longer match the canvas size.
+      if (initialized) {
+        undoStack.current = []
+        setCanUndo(false)
+      }
+      initialized = true
+    }
+
     const observer = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect
-      const ratio = WIDTH / HEIGHT
-      if (width / height > ratio) {
-        setBoardSize({ width: height * ratio, height })
-      } else {
-        setBoardSize({ width, height: width / ratio })
+      if (!initialized) {
+        resize(width, height)
+        return
       }
+      clearTimeout(timer)
+      timer = setTimeout(() => resize(width, height), RESIZE_DELAY)
     })
     observer.observe(area)
-    return () => observer.disconnect()
-  }, [])
-
-  const renderOutline = useCallback((id: string | null) => {
-    const ctx = outlineRef.current?.getContext('2d', {
-      willReadFrequently: true,
-    })
-    if (!ctx) return
-    ctx.clearRect(0, 0, WIDTH, HEIGHT)
-    const page = coloringPages.find((p) => p.id === id)
-    if (page) drawColoringPage(ctx, page, WIDTH, HEIGHT)
-  }, [])
-
-  useEffect(() => renderOutline(pageId), [pageId, renderOutline])
+    return () => {
+      clearTimeout(timer)
+      observer.disconnect()
+    }
+  }, [renderOutline])
 
   // --- Undo --------------------------------------------------------------
 
   const pushUndo = () => {
     const ctx = paintCtx()
     if (!ctx) return
+    const { width, height } = dims()
     undoStack.current.push({
-      image: ctx.getImageData(0, 0, WIDTH, HEIGHT),
+      image: ctx.getImageData(0, 0, width, height),
       pageId,
     })
     if (undoStack.current.length > MAX_UNDO) undoStack.current.shift()
@@ -151,6 +201,14 @@ export function DrawingBoard() {
     const snap = undoStack.current.pop()
     const ctx = paintCtx()
     if (!snap || !ctx) return
+    if (
+      snap.image.width !== ctx.canvas.width ||
+      snap.image.height !== ctx.canvas.height
+    ) {
+      undoStack.current = []
+      setCanUndo(false)
+      return
+    }
     ctx.putImageData(snap.image, 0, 0)
     setPageId(snap.pageId)
     setCanUndo(undoStack.current.length > 0)
@@ -171,10 +229,11 @@ export function DrawingBoard() {
   // --- Drawing -----------------------------------------------------------
 
   const toCanvas = (e: { clientX: number; clientY: number }): Point => {
-    const rect = paintRef.current!.getBoundingClientRect()
+    const canvas = paintRef.current!
+    const rect = canvas.getBoundingClientRect()
     return {
-      x: ((e.clientX - rect.left) / rect.width) * WIDTH,
-      y: ((e.clientY - rect.top) / rect.height) * HEIGHT,
+      x: ((e.clientX - rect.left) / rect.width) * canvas.width,
+      y: ((e.clientY - rect.top) / rect.height) * canvas.height,
     }
   }
 
@@ -233,12 +292,13 @@ export function DrawingBoard() {
   }
 
   const bucketFill = (ctx: CanvasRenderingContext2D, p: Point) => {
-    const paint = ctx.getImageData(0, 0, WIDTH, HEIGHT)
+    const { width, height } = dims()
+    const paint = ctx.getImageData(0, 0, width, height)
     const outlineCtx = outlineRef.current?.getContext('2d', {
       willReadFrequently: true,
     })
     const outline = pageId
-      ? (outlineCtx?.getImageData(0, 0, WIDTH, HEIGHT) ?? null)
+      ? (outlineCtx?.getImageData(0, 0, width, height) ?? null)
       : null
     const changed = floodFill(paint, outline, p.x, p.y, hexToRgb(color))
     if (changed) ctx.putImageData(paint, 0, 0)
@@ -297,7 +357,7 @@ export function DrawingBoard() {
     if (!ctx) return
     pushUndo()
     ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, WIDTH, HEIGHT)
+    ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height)
     setPageId(page?.id ?? null)
     setPickerOpen(false)
     if (page) setTool('bucket')
@@ -312,8 +372,8 @@ export function DrawingBoard() {
     setFlashKey((k) => k + 1)
 
     const out = document.createElement('canvas')
-    out.width = WIDTH
-    out.height = HEIGHT
+    out.width = paint.width
+    out.height = paint.height
     const ctx = out.getContext('2d')!
     ctx.drawImage(paint, 0, 0)
     ctx.drawImage(outline, 0, 0)
@@ -445,38 +505,28 @@ export function DrawingBoard() {
 
         <div
           ref={areaRef}
-          style={{ width: "100%", height: "100%" }}
-          className="flex min-h-0 min-w-0 flex-1 items-center justify-center"
+          className="relative min-h-0 min-w-0 flex-1 overflow-hidden rounded-[2rem] bg-white shadow-[0_8px_30px_-8px_oklch(0.4_0.08_280/0.35)] ring-4 ring-white"
         >
-          <div
-            className="relative overflow-hidden rounded-[2rem] bg-white shadow-[0_8px_30px_-8px_oklch(0.4_0.08_280/0.35)] ring-4 ring-white"
-            style={{ width: boardSize.width, height: boardSize.height }}
-          >
-            <canvas
-              ref={paintRef}
-              width={WIDTH}
-              height={HEIGHT}
-              aria-label="Drawing board"
-              className={cn(
-                'absolute inset-0 size-full touch-none',
-                tool === 'stamp' || tool === 'bucket'
-                  ? 'cursor-pointer'
-                  : 'cursor-crosshair',
-              )}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={endStroke}
-              onPointerCancel={endStroke}
-              onContextMenu={(e) => e.preventDefault()}
-            />
-            <canvas
-              ref={outlineRef}
-              width={WIDTH}
-              height={HEIGHT}
-              aria-hidden
-              className="pointer-events-none absolute inset-0 size-full"
-            />
-          </div>
+          <canvas
+            ref={paintRef}
+            aria-label="Drawing board"
+            className={cn(
+              'absolute inset-0 size-full touch-none',
+              tool === 'stamp' || tool === 'bucket'
+                ? 'cursor-pointer'
+                : 'cursor-crosshair',
+            )}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={endStroke}
+            onPointerCancel={endStroke}
+            onContextMenu={(e) => e.preventDefault()}
+          />
+          <canvas
+            ref={outlineRef}
+            aria-hidden
+            className="pointer-events-none absolute inset-0 size-full"
+          />
         </div>
       </main>
 
